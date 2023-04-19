@@ -1,8 +1,7 @@
 import type {
-  AzureFunction,
-  Context,
+  HttpHandler,
   HttpRequest,
-  HttpRequestHeaders,
+  InvocationContext,
 } from '@azure/functions';
 import {
   ApolloServer,
@@ -14,8 +13,9 @@ import {
 import type { WithRequired } from '@apollo/utils.withrequired';
 
 export interface AzureFunctionsContextFunctionArgument {
-  context: Context;
   req: HttpRequest;
+  context: InvocationContext;
+  body: unknown;
 }
 
 export interface AzureFunctionsMiddlewareOptions<TContext extends BaseContext> {
@@ -30,24 +30,25 @@ const defaultContext: ContextFunction<
 export function startServerAndCreateHandler(
   server: ApolloServer<BaseContext>,
   options?: AzureFunctionsMiddlewareOptions<BaseContext>,
-): AzureFunction;
+): HttpHandler;
 export function startServerAndCreateHandler<TContext extends BaseContext>(
   server: ApolloServer<TContext>,
   options: WithRequired<AzureFunctionsMiddlewareOptions<TContext>, 'context'>,
-): AzureFunction;
+): HttpHandler;
 export function startServerAndCreateHandler<TContext extends BaseContext>(
   server: ApolloServer<TContext>,
   options?: AzureFunctionsMiddlewareOptions<TContext>,
-): AzureFunction {
+): HttpHandler {
   server.startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests();
-  return async (context: Context, req: HttpRequest) => {
+  return async (req: HttpRequest, context: InvocationContext) => {
     const contextFunction = options?.context ?? defaultContext;
     try {
-      const normalizedRequest = normalizeRequest(req);
+      const normalizedRequest = await normalizeRequest(req);
 
       const { body, headers, status } = await server.executeHTTPGraphQLRequest({
         httpGraphQLRequest: normalizedRequest,
-        context: () => contextFunction({ context, req }),
+        context: () =>
+          contextFunction({ req, context, body: normalizedRequest.body }),
       });
 
       if (body.kind === 'chunked') {
@@ -63,7 +64,7 @@ export function startServerAndCreateHandler<TContext extends BaseContext>(
         body: body.string,
       };
     } catch (e) {
-      context.log.error('Failure processing GraphQL request', e);
+      context.error('Failure processing GraphQL request', e);
       return {
         status: 400,
         body: (e as Error).message,
@@ -72,7 +73,7 @@ export function startServerAndCreateHandler<TContext extends BaseContext>(
   };
 }
 
-function normalizeRequest(req: HttpRequest): HTTPGraphQLRequest {
+async function normalizeRequest(req: HttpRequest): Promise<HTTPGraphQLRequest> {
   if (!req.method) {
     throw new Error('No method');
   }
@@ -81,34 +82,29 @@ function normalizeRequest(req: HttpRequest): HTTPGraphQLRequest {
     method: req.method,
     headers: normalizeHeaders(req.headers),
     search: new URL(req.url).search,
-    body: parseBody(req.method, req.body, req.headers['content-type']),
+    body: await parseBody(req),
   };
 }
 
-function parseBody(
-  method: string | undefined,
-  body: string | null | undefined,
-  contentType: string | undefined,
-): object | null {
-  const isValidContentType = contentType?.startsWith('application/json');
-  const isValidPostRequest = method === 'POST' && isValidContentType;
+async function parseBody(req: HttpRequest): Promise<object | string | null> {
+  const isValidContentType = req.headers
+    .get('content-type')
+    ?.startsWith('application/json');
+  const isValidPostRequest = req.method === 'POST' && isValidContentType;
 
   if (isValidPostRequest) {
-    if (typeof body === 'string') {
-      return JSON.parse(body);
-    }
-    if (typeof body === 'object') {
-      return body;
-    }
+    return req.json() as Promise<object>;
+  } else if (isValidContentType) {
+    return req.text() as Promise<string>;
   }
 
-  return null;
+  return Promise.resolve(null);
 }
 
-function normalizeHeaders(headers: HttpRequestHeaders): HeaderMap {
+function normalizeHeaders(headers: Headers): HeaderMap {
   const headerMap = new HeaderMap();
-  for (const [key, value] of Object.entries(headers)) {
+  headers.forEach((value, key) => {
     headerMap.set(key, value ?? '');
-  }
+  });
   return headerMap;
 }
